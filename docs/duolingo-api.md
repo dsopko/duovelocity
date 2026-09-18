@@ -21,7 +21,8 @@ Duolingo versions endpoints by **calendar date** embedded in the path (like Stri
 
 | Endpoint family | Version segment | Source |
 |---|---|---|
-| User read | `/2017-06-30/users/{id}` | [M0] |
+| User read | `/2017-06-30/users/{id}` (also `/2023-05-23/users/{id}`, used by the web app) | [M0] |
+| Daily activity | `/2023-05-23/users/{id}/xp_summaries` | [M0] |
 | Login | `/2023-05-23/login` | [M0] |
 | Legacy user read | `/users/{username}` (no version) | [legacy] |
 
@@ -222,6 +223,7 @@ Two reliable structural signals [M0]:
 | Source | Resolution | Retention |
 |---|---|---|
 | `xpGains[].time` | second (epoch) | ~7 days |
+| `xp_summaries[].date` (§11.1) | day (epoch) | ~15 months |
 | `creationDate`, `streakData.*Timestamp` | second (epoch) | permanent (account/streak level) |
 | `streakData.*Streak.*Date` | day (`YYYY-MM-DD`) | permanent (streak boundaries) |
 | path nodes/units | **none** | — |
@@ -251,7 +253,7 @@ These lists are from one account's current course; log unknown values and extend
 
 ## 10. Known limitations and quirks
 
-- **~7–8 day event retention.** `xpGains` (and legacy `calendar`) only hold about a week. A missed week is an irrecoverable gap for lesson-level data. Node/unit completions are still detected by diff, but lose precise timestamps.
+- **~7–8 day retention applies only to per-lesson data.** `xpGains` (and legacy `calendar`) hold about a week, so a missed week is an irrecoverable gap for *lesson-level* detail (skill ids, lesson/practice split). **Daily totals do not have this limit:** `xp_summaries` (§11.1) exposes ~15 months of per-day XP and session counts, backfillable at connect time. Node/unit completions are still detected by path diff, but lose precise timestamps when the finishing lessons age out.
 - **Current course only.** The user read returns the last-practiced course; multi-course tracking needs separate handling.
 - **No path timestamps.** Completion dates are always derived, never read.
 - **Captcha-gated login.** No headless password login; the token is the durable credential.
@@ -260,7 +262,54 @@ These lists are from one account's current course; log unknown values and extend
 
 ---
 
-## 11. References
+## 11. Lightweight and targeted endpoints [M0]
+
+Found by watching the web app load `/learn` (2026-09-18): ~54 requests, nearly all under 5 KB. **The app never pulls the full course path on load** — the 9 MB `currentCourse` response is a consequence of DuoVelocity asking for that whole field, not an app default. The app's heaviest call is ~575 KB (`/2023-05-23/users/{id}` with a large profile/settings/courses `fields` list, which does *not* include the full path). These small endpoints cover most of DuoVelocity's needs cheaply.
+
+### 11.1 `GET /2023-05-23/users/{id}/xp_summaries` — daily activity (recommended)
+
+A compact per-day rollup, and the important find: **retention is ~15 months**, not 7 days. Observed 462 daily entries (2025-05-06 → 2026-09-18) in ~83 KB. Query with `startDate`.
+
+```
+GET https://www.duolingo.com/2023-05-23/users/{id}/xp_summaries?startDate=2025-01-01
+Authorization: Bearer <jwt>
+```
+
+Response: `{ "summaries": [ ... ] }`. Each entry:
+
+| Field | Meaning |
+|---|---|
+| `date` | epoch seconds, local midnight of the day |
+| `gainedXp` | total XP earned that day |
+| `numSessions` | number of sessions completed that day |
+| `totalSessionTime` | seconds spent in sessions |
+| `streakExtended`, `frozen`, `shielded`, `repaired` | streak bookkeeping |
+| `dailyGoalXp` | that day's XP goal |
+
+**Use and limits:** the cheap, long-history source for *daily activity*; it enables **~15-month backfill at connect time** instead of only observing forward. But it is a daily rollup — `numSessions` counts all sessions (lessons **and** activities) with no `skillId` and no lesson/practice split. It does **not** replace `xpGains` (§6) for per-lesson attribution, nor the path diff for unit completions.
+
+### 11.2 `GET /2023-05-23/users/{id}` — newer user read
+
+The version the web app itself uses for the main user object (vs. our `2017-06-30`). Same `fields`-list mechanism. Either version serves the fields DuoVelocity needs; `2017-06-30` is the one verified for `xpGains` and `currentCourse`.
+
+### 11.3 `GET /2023-05-23/score-info/courses/{COURSE}?fields=scores` — Score (observed, shape unconfirmed)
+
+Seen in app traffic returning ~0.4 KB with the Score (e.g. `COURSE = DUOLINGO_ES_EN`). A direct replay returned HTTP 400, so the app sends request context not yet reproduced. Until confirmed, read the Score from `currentCourse.scoreMetadata` (§7.1).
+
+### 11.4 Other small endpoints seen on load
+
+All sub-2 KB, not needed by DuoVelocity, noted for orientation: `/users/{id}/streak-goal-current`, `/streak-goal-next-options`, `/2017-06-30/users/{id}/courses/{learning}/{from}/learned-lexemes/count`, `/practice-lexemes`, `/2023-05-23/shop-items`, `/2017-06-30/messaging/get-messages/`, `/2017-06-30/friends/...`, `/quests`.
+
+### 11.5 Sourcing DuoVelocity's data cheaply
+
+| Need | Cheap source | Full path (9 MB) required? |
+|---|---|---|
+| Daily activity (sessions/day, XP/day), backfillable ~15 mo | `xp_summaries` (§11.1) | No |
+| Lessons vs activities split (last ~7 days) | `xpGains` (§6) | No |
+| Score | `currentCourse.scoreMetadata` (§7.1) | No (small `fields` pull) |
+| Unit completions (units/week, units/month) | path diff (§7.2, §8) | Yes, but only on nights with new lessons |
+
+## 12. References
 
 - `bartsonb/duolingo-activity-history` — legacy `/users/{username}` + `calendar` [legacy]
 - `duoplanet.com/duolingo-score` — Score/CEFR bands [community]
