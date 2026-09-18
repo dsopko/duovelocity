@@ -39,7 +39,7 @@ These six words are the entity names in `Core`. The word **"level"** is banned �
 | **Node** | One bubble on the path: lesson, story, practice, chest, unit test | `units[].levels[]` (`type`, `state`, `finishedSessions`, `totalSessions`) |
 | **Lesson** | One session inside a lesson node. A node holds *N* lessons (`totalSessions`); N may be 1. | `xpGains[]` where `eventType == LESSON` |
 | **Activity** | XP-earning work *off* the path (practice zone, review of a completed node, stories replayed) | `xpGains[]` where `eventType != LESSON` |
-| **Score** | The number next to the course flag (Duolingo Score, 0–160); rises on unit completion. This is what users call their "level" — named Score internally; UI copy may say *level* | field TBD — see §14 |
+| **Score** | The **Duolingo Score**, shown top-left on the path and on the profile: a CEFR-aligned proficiency number, **0–130** for the major courses (English, Spanish, French), capped lower on less-developed courses. Rises as lessons, units, and sections are completed. This is what users (and older UI copy) call their "level"; named Score internally. Distinct from XP — see §7.2 | `currentCourse.scoreMetadata.reachedScore` (M0) |
 
 ## 4. Metric definitions
 
@@ -121,7 +121,7 @@ Duolingo publishes no API. DuoVelocity calls the same endpoints the web client u
 | `courses[]` (`id`, `title`, `learningLanguage`, `fromLanguage`, `xp`, `crowns`) | course registry; which is current |
 | `xpGains[]` (`xp`, `skillId`, `time`, `eventType`) | lesson and activity events. `time` is the only per-lesson timestamp (Unix epoch seconds). **~7-day retention** — this is why sync is nightly and why a missed week is an irrecoverable gap. M0 saw `eventType` values `LESSON`, `PRACTICE`, and `null` — see §7.1 |
 | `currentCourse.pathSectioned[]` → `units[]` → `levels[]` (`type`, `state`, `finishedSessions`, `totalSessions`, `pathLevelMetadata`/`pathLevelClientData` incl. skill ids, unit index/name) | node and unit state. **No timestamps — confirmed by M0** (§7.1); completion dates are derived by diffing |
-| Score | field TBD (M0 finds it in the raw JSON) |
+| `currentCourse.scoreMetadata` (`reachedScore`, `pathStartingScore`, `pathEndingScore`, `supportType`) | the Duolingo Score and this course's Score range and cap — M0 resolved, see §7.2 |
 
 **Landing rule:** every response is stored verbatim (`RawSnapshot`) before parsing. Field names drift; the raw column is the insurance policy that lets history be re-parsed later.
 
@@ -147,6 +147,39 @@ M0 read a live payload and searched every field for anything temporal. The resul
 | `streakData.currentStreak` / `longestStreak` / `previousStreak` | objects of ISO `YYYY-MM-DD` date strings (`startDate`, `endDate`, `lastExtendedDate`, `achieveDate`) | streak boundaries at **day** resolution only |
 
 Takeaway for the data model: none of these replaces the snapshot diff. `xpGains[].time` sharpens node-completion attribution while it is fresh; the streak dates are day-resolution and about streaks, not lessons or units. The `RawSnapshot` landing rule (above) still captures all of it verbatim so any of these can be re-parsed later.
+
+### 7.2 The Duolingo Score (M0 findings, resolves §14 risk #4)
+
+The Score is the CEFR-aligned proficiency number shown top-left on the path and on the profile — the number many users call their "level." M0 located it and read the surrounding metadata.
+
+**Field:** `currentCourse.scoreMetadata`, an object:
+
+| Key | Sample | Meaning |
+|---|---|---|
+| `reachedScore` | 66 | the user's current Score — this is the value `ScoreHistory` records |
+| `pathStartingScore` | 5 | Score at the start of this course's path |
+| `pathEndingScore` | 129 | this course's cap — **read it, never hardcode** |
+| `supportType` | `FULLY_CEFR_ALIGNED` | how far the course is CEFR-aligned |
+
+**Range and cap.** The Score runs 0–130 on the fully built courses (English, Spanish, French; more are being extended to 130). Less-developed courses stop lower — some at 60 or less — because the cap tracks how much CEFR-aligned content exists. So the ceiling is per-course: use `pathEndingScore`, not a constant. (The doc previously said 0–160; that was wrong.)
+
+**CEFR bands** (from duoplanet.com/duolingo-score, corroborated by the API's own per-unit `cefrLevel` and a band string of `60-79`/`B1` observed for score 66):
+
+| Score | CEFR |
+|---|---|
+| 0–9 / 10–19 / 20–29 | A1 (very early / early / high) |
+| 30–59 | A2 |
+| 60–79 / 80–99 | B1 (early / high) |
+| 100–114 / 115–129 | B2 (early / high) |
+| 130 | cap of the major courses (high B2) |
+
+Treat these cut points as Duolingo's rule of thumb, not a contract: if a CEFR label is ever shown, read `cefrLevel` from the payload rather than computing it from the number.
+
+**What moves it.** The Score rises as lessons, units, and sections are completed (practice, stories, and the like also contribute). In the path data this shows up as a per-node `levelScoreInfo.reachedScore` and per-section `sectionStartingScore`/`sectionEndingScore`, climbing toward `pathEndingScore`. For v1, DuoVelocity reads only the course-level `scoreMetadata.reachedScore` and records changes; it does not need the per-node score breakdown.
+
+**Score is not XP and not streak.** Three independent numbers: Score is proficiency (0–130, hundreds of hours to max out), XP is lifetime activity points (this account: ~195k), streak is consecutive days. DuoVelocity tracks Score over time as a velocity metric and never conflates it with XP.
+
+**Terminology.** The word "level" is banned internally (§3) precisely because this payload overloads it: a path node is a `level`, there is `levelScoreInfo`, `cefrLevel`, and `crownLevelIndex`, and users call the Score their "level." The 0–130 number is only ever `scoreMetadata.reachedScore`.
 
 ## 8. Data model
 
@@ -187,6 +220,7 @@ Unique: `(CourseId, SectionIndex, UnitIndex)`
 
 **`ScoreHistory`**
 `ScoreHistoryId`, `AppUserId`, `CourseId`, `LocalDate`, `Score`, `CreatedUtc`
+`Score` is `currentCourse.scoreMetadata.reachedScore` (§7.2). The per-course cap `pathEndingScore` is a property of the `Course`, not a daily fact, so it belongs on `Course` if surfaced at all, not here.
 Unique: `(AppUserId, CourseId, LocalDate)`
 
 Why store only transitions rather than nightly node state: a course has hundreds to thousands of nodes; a per-node-per-day table would be ~700k rows per user per year with almost no information in it. `RawSnapshot` already holds the full history; `PathNode` holds "now"; `NodeCompletion` holds the change.
@@ -295,7 +329,7 @@ Timezones in .NET: `TimeZoneInfo.FindSystemTimeZoneById` accepts IANA ids cross-
 | 1 | **Unofficial API** — endpoints, auth flow, or field names can change without notice | Raw landing; parsers tolerant of extra/missing fields; alerts on unknown values; accept that a breaking change means a maintenance release. **M0 confirmed login is captcha-gated** (reCAPTCHA Enterprise token in the login body), so server-side login is off the table — token-only connect (§10.3) |
 | 2 | Duolingo ToS — this access is not sanctioned | Personal-scale use; one polite request per user per night; document the risk to users at connect time |
 | 3 | ~~JWT lifetime unknown~~ **Resolved (M0):** the token's `exp` is ~200 years out with `iat` unset, so it does not self-expire. Only a password change or server-side revocation kills it (surfaces as 401 → `TokenRevoked`). 14-day empirical revocation test running as of 2026-09-18 | Reconnect flow handles the revocation case; no re-login needed |
-| 4 | Score field location unknown | M0: find it in the raw JSON; if absent, Score is dropped from v1 metrics |
+| 4 | ~~Score field location unknown~~ **Resolved (M0):** the Score is `currentCourse.scoreMetadata.reachedScore`; the course cap is `pathEndingScore` (§7.2). Score stays a v1 metric | — |
 | 5 | `eventType` / `NodeType` full enumerations undocumented | Log unknowns; build the list from real data. M0 saw `eventType` ∈ {`LESSON`, `PRACTICE`, `null`} (§7.1); node `state`/`nodeState` includes `passed`. Treat "not `LESSON`" as activity rather than matching a fixed activity type |
 | 6 | Lesson-to-node ratio may be 1 or N | Never assumed; both counted independently |
 | 7 | F1 quotas (CPU/day) could stop the API under real traffic | Monitor quotas; B1 upgrade is the escape hatch |
@@ -307,7 +341,7 @@ Timezones in .NET: `TimeZoneInfo.FindSystemTimeZoneById` accepts IANA ids cross-
 
 | Milestone | Deliverable | Answers |
 |---|---|---|
-| **M0 — Spike** (CLI only, no DB) | ~~`login`~~ token capture from browser, `decode-token`, `dump` (raw JSON to disk, redacted fixture for `samples/`) | **Done:** login is captcha-gated (token-only connect); JWT does not self-expire; users endpoint `2017-06-30/users/{id}` works with a Bearer token. Still open: field names, `totalSessions` ratio, `eventType` values, Score field. 14-day revocation test running |
+| **M0 — Spike** (CLI only, no DB) | ~~`login`~~ token capture from browser, `decode-token`, `dump` (raw JSON to disk, redacted fixture for `samples/`) | **Done:** login is captcha-gated (token-only connect); JWT does not self-expire; users endpoint `2017-06-30/users/{id}` works with a Bearer token. Score field resolved (`scoreMetadata.reachedScore`, §7.2). Still open: full `NodeType`/`eventType` enumerations, `totalSessions` ratio on more data. 14-day revocation test running |
 | **M1 — Core + CLI** | Parsers, `PathDiffer` with tests on fixture JSON, `XpEvent` ingest, metrics queries; local SQL (LocalDB) | Diff algorithm correct on real data (David's own history) |
 | **M2 — Azure nightly** | Free SQL DB, Function App (timer + queue), Key Vault, App Insights; David as the only connected user | Runs unattended for two weeks |
 | **M3 — API + identity** | Entra External ID, connect/disconnect flow, metrics endpoints, F1 deploy, privacy page | Second user (family) connects successfully |
@@ -324,6 +358,7 @@ Timezones in .NET: `TimeZoneInfo.FindSystemTimeZoneById` accepts IANA ids cross-
 | 2026-09-15 | ~~Store JWT always, password opt-in; re-login on expiry only if password stored~~ |
 | 2026-09-18 | **Superseded by M0 findings:** login is captcha-gated, so no server-side login. Token-only connect; no password ever stored; reconnect flow on 401 (`TokenRevoked`). JWT confirmed non-expiring (`exp` ~200 yrs, `iat` unset) |
 | 2026-09-18 | M0 timestamp audit (§7.1): path has no completion dates (confirmed); `xpGains[].time` is the only per-lesson timestamp and ages out in ~7 days; `eventType` can be `null`; other timestamps (creationDate, streakData) are account/streak-level, day-resolution, not a completion source |
+| 2026-09-18 | M0 Score found (§7.2): Score is `currentCourse.scoreMetadata.reachedScore`, range 0–130 with a per-course cap (`pathEndingScore`), CEFR-aligned. Corrects the earlier "0–160". Score and XP are distinct metrics |
 | 2026-09-15 | No-login/public-profile mode rejected — lessons and units require auth |
 | 2026-09-15 | Vocabulary fixed: Section, Unit, Node, Lesson, Activity, Score; "level" banned |
 | 2026-09-15 | Land raw JSON for every pull; store node *transitions*, not nightly node state |
