@@ -12,12 +12,20 @@ Duolingo shows you a streak and today's XP, but nothing about *pace*. DuoVelocit
 
 The core problem is that Duolingo keeps per-lesson history for only ~7 days and stamps no completion dates on the learning path at all. So DuoVelocity's job is to **observe daily and remember**: archive lesson events before they roll off, and manufacture unit/node completion dates by diffing nightly snapshots.
 
+**DuoVelocity tracks exactly three things.** Everything else in the payload is either supporting data or noise.
+
+1. **`LESSON` events** — path-advancing lesson events (`xpGains[]` with `eventType = LESSON`), each carrying a `time` and a `skillId`. These are the timestamped record of what was done and when, and they must be archived before the ~7-day window erases them (§7.1). They drive lessons/day.
+2. **Units** — a unit's completion is detected by diffing nightly snapshots and dated from the finishing `LESSON` event (§9.3). Units drive units/week and units/month. Nodes exist only to detect and date unit completion.
+3. **Score** — the Duolingo Score, `currentCourse.scoreMetadata.reachedScore` (§7.2), recorded over time.
+
+Deliberately outside this: practice and other non-`LESSON` activity, XP totals, streak, and leagues. They are read past, not tracked.
+
 ## 2. Goals and non-goals
 
 **Goals (v1)**
 - Multi-user from day one: anyone can sign up, connect their Duolingo account, and see their own velocity.
 - Nightly sync at 04:30 US Eastern, per user, with no gaps larger than the 7-day `xpGains` window.
-- Metrics: lessons/day, units/week, units/month, Score over time. Nodes are tracked as supporting data (they are how unit completion is detected and timestamped) but are not a v1 metric.
+- Metrics, all derived from the three tracked things (§1): lessons/day from `LESSON` events, units/week and units/month from unit completions, Score over time. Nodes are supporting data (how unit completion is detected and dated), not a v1 metric.
 - A bearer-token JSON API that any frontend (web or mobile) can consume. Frontend itself is TBD and out of scope for this doc.
 - $0/month hosting at hobby scale on Azure free tiers.
 - Honest credential handling: users are told plainly what DuoVelocity holds and what the operator can see.
@@ -359,6 +367,7 @@ Timezones in .NET: `TimeZoneInfo.FindSystemTimeZoneById` accepts IANA ids cross-
 | 2026-09-18 | **Superseded by M0 findings:** login is captcha-gated, so no server-side login. Token-only connect; no password ever stored; reconnect flow on 401 (`TokenRevoked`). JWT confirmed non-expiring (`exp` ~200 yrs, `iat` unset) |
 | 2026-09-18 | M0 timestamp audit (§7.1): path has no completion dates (confirmed); `xpGains[].time` is the only per-lesson timestamp and ages out in ~7 days; `eventType` can be `null`; other timestamps (creationDate, streakData) are account/streak-level, day-resolution, not a completion source |
 | 2026-09-18 | M0 Score found (§7.2): Score is `currentCourse.scoreMetadata.reachedScore`, range 0–130 with a per-course cap (`pathEndingScore`), CEFR-aligned. Corrects the earlier "0–160". Score and XP are distinct metrics |
+| 2026-09-18 | Primary objective stated as exactly three tracked things (§1): `LESSON` events, Units, Score. Practice/activity, XP totals, streak, leagues are explicitly not tracked |
 | 2026-09-15 | No-login/public-profile mode rejected — lessons and units require auth |
 | 2026-09-15 | Vocabulary fixed: Section, Unit, Node, Lesson, Activity, Score; "level" banned |
 | 2026-09-15 | Land raw JSON for every pull; store node *transitions*, not nightly node state |
