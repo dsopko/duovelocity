@@ -119,13 +119,34 @@ Duolingo publishes no API. DuoVelocity calls the same endpoints the web client u
 |---|---|
 | `id`, `username`, `timezone`, `learningLanguage`, `fromLanguage` | identity, day bucketing |
 | `courses[]` (`id`, `title`, `learningLanguage`, `fromLanguage`, `xp`, `crowns`) | course registry; which is current |
-| `xpGains[]` (`xp`, `skillId`, `time`, `eventType`) | lesson and activity events. **~7-day retention** — this is why sync is nightly and why a missed week is an irrecoverable gap |
-| `currentCourse.pathSectioned[]` → `units[]` → `levels[]` (`type`, `state`, `finishedSessions`, `totalSessions`, `pathLevelMetadata`/`pathLevelClientData` incl. skill ids, unit index/name) | node and unit state. **No timestamps** — completion dates are derived by diffing |
+| `xpGains[]` (`xp`, `skillId`, `time`, `eventType`) | lesson and activity events. `time` is the only per-lesson timestamp (Unix epoch seconds). **~7-day retention** — this is why sync is nightly and why a missed week is an irrecoverable gap. M0 saw `eventType` values `LESSON`, `PRACTICE`, and `null` — see §7.1 |
+| `currentCourse.pathSectioned[]` → `units[]` → `levels[]` (`type`, `state`, `finishedSessions`, `totalSessions`, `pathLevelMetadata`/`pathLevelClientData` incl. skill ids, unit index/name) | node and unit state. **No timestamps — confirmed by M0** (§7.1); completion dates are derived by diffing |
 | Score | field TBD (M0 finds it in the raw JSON) |
 
 **Landing rule:** every response is stored verbatim (`RawSnapshot`) before parsing. Field names drift; the raw column is the insurance policy that lets history be re-parsed later.
 
 **Etiquette:** one request per user per night, sequential with a small delay, a descriptive `User-Agent`, exponential backoff on 429/5xx. Never hammer.
+
+### 7.1 Timestamps in the payload (M0 findings, 2026-09-18)
+
+M0 read a live payload and searched every field for anything temporal. The result confirms the project's founding premise: **the learning path carries no completion dates, so the only per-lesson timestamp is `xpGains[].time`, and it lives for only ~7 days.** Everything else is either account-level or streak-level and daily-resolution at best.
+
+**The one timestamp that matters — `xpGains[].time`.** Each `xpGains` entry (a lesson or activity event) has a `time` field in Unix epoch seconds. This is the per-lesson timestamp: it is what lets §9.3 attribute a real completion time to a node (`Attribution = LessonEvent`) instead of falling back to snapshot day. It is also the field that ages out after ~7 days, which is the whole reason the sync must run nightly. In the sample, 74 events came back with `eventType` split `LESSON` 25, `PRACTICE` 12, and **`null` 37** — a `null` type (skill id also null) is common, so §4/§5 bucketing must treat "not `LESSON`" as activity rather than testing for a specific activity type. Log unknown/`null` types (§14 risk #5).
+
+**The path has no dates — confirmed.** A path node (`levels[]`) exposes `state` (e.g. `"passed"`), `pathLevelMetadata.nodeState` (e.g. `"passed"`), `finishedSessions`/`totalSessions` (counts), `type`/`subtype`, skill ids, indices, and score info. **None of these is a timestamp.** Names that pattern-match as temporal — `completedUnits`, `finishedSessions`, `finishedLessons`, `finishedLevels`, `completedLevels`, `checkpointFinished`, `finalLevelTimeLimit` — are all counts, flags, or a per-lesson time *limit* in seconds, never a completion date. This is why node and unit completion dates must be manufactured by diffing nightly snapshots (§9.3), exactly as designed.
+
+**Other timestamps exist but are not per-lesson.** They are useful context, not a completion source:
+
+| Field | Format | What it is |
+|---|---|---|
+| `creationDate` | epoch seconds | account creation date (one value, historical) |
+| `streakData.startTimestamp` | epoch seconds | when the current streak began |
+| `streakData.updatedTimestamp` | epoch seconds | last streak update (rolls over daily) |
+| `streakData.churnedStreakTimestamp` | epoch seconds | 0 when not churned |
+| `streakData.updatedTimeZone` | IANA string | e.g. `America/New_York` — cross-checks the profile `timezone` used for day bucketing |
+| `streakData.currentStreak` / `longestStreak` / `previousStreak` | objects of ISO `YYYY-MM-DD` date strings (`startDate`, `endDate`, `lastExtendedDate`, `achieveDate`) | streak boundaries at **day** resolution only |
+
+Takeaway for the data model: none of these replaces the snapshot diff. `xpGains[].time` sharpens node-completion attribution while it is fresh; the streak dates are day-resolution and about streaks, not lessons or units. The `RawSnapshot` landing rule (above) still captures all of it verbatim so any of these can be re-parsed later.
 
 ## 8. Data model
 
@@ -275,7 +296,7 @@ Timezones in .NET: `TimeZoneInfo.FindSystemTimeZoneById` accepts IANA ids cross-
 | 2 | Duolingo ToS — this access is not sanctioned | Personal-scale use; one polite request per user per night; document the risk to users at connect time |
 | 3 | ~~JWT lifetime unknown~~ **Resolved (M0):** the token's `exp` is ~200 years out with `iat` unset, so it does not self-expire. Only a password change or server-side revocation kills it (surfaces as 401 → `TokenRevoked`). 14-day empirical revocation test running as of 2026-09-18 | Reconnect flow handles the revocation case; no re-login needed |
 | 4 | Score field location unknown | M0: find it in the raw JSON; if absent, Score is dropped from v1 metrics |
-| 5 | `eventType` / `NodeType` full enumerations undocumented | Log unknowns; build the list from real data |
+| 5 | `eventType` / `NodeType` full enumerations undocumented | Log unknowns; build the list from real data. M0 saw `eventType` ∈ {`LESSON`, `PRACTICE`, `null`} (§7.1); node `state`/`nodeState` includes `passed`. Treat "not `LESSON`" as activity rather than matching a fixed activity type |
 | 6 | Lesson-to-node ratio may be 1 or N | Never assumed; both counted independently |
 | 7 | F1 quotas (CPU/day) could stop the API under real traffic | Monitor quotas; B1 upgrade is the escape hatch |
 | 8 | SQL free tier exhaustion at multi-user scale | "Pause until next month" setting; watch vCore-seconds; the nightly fan-out is bursty, so consider spreading users across the 04:00–05:00 hour if it becomes a problem |
@@ -302,6 +323,7 @@ Timezones in .NET: `TimeZoneInfo.FindSystemTimeZoneById` accepts IANA ids cross-
 | 2026-09-15 | API on App Service F1; frontend TBD |
 | 2026-09-15 | ~~Store JWT always, password opt-in; re-login on expiry only if password stored~~ |
 | 2026-09-18 | **Superseded by M0 findings:** login is captcha-gated, so no server-side login. Token-only connect; no password ever stored; reconnect flow on 401 (`TokenRevoked`). JWT confirmed non-expiring (`exp` ~200 yrs, `iat` unset) |
+| 2026-09-18 | M0 timestamp audit (§7.1): path has no completion dates (confirmed); `xpGains[].time` is the only per-lesson timestamp and ages out in ~7 days; `eventType` can be `null`; other timestamps (creationDate, streakData) are account/streak-level, day-resolution, not a completion source |
 | 2026-09-15 | No-login/public-profile mode rejected — lessons and units require auth |
 | 2026-09-15 | Vocabulary fixed: Section, Unit, Node, Lesson, Activity, Score; "level" banned |
 | 2026-09-15 | Land raw JSON for every pull; store node *transitions*, not nightly node state |
