@@ -7,3 +7,10 @@ samples/**/*token*
 
 # throwaway M0 token spike - never commit (handles a live token)
 duo-token-test.ps1
+
+# personal Duolingo captures (live account data) — not for the repo
+samples/duolingo-full-es_en.json
+samples/duolingo-full-es_en.pretty.json
+samples/es_en-unit194-raw.json
+samples/es_en-unit194-raw.min.json
+samples/es_en-unit194-survey.json
