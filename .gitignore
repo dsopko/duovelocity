@@ -4,3 +4,6 @@ obj/
 *.user
 appsettings.*.local.json
 samples/**/*token*
+
+# throwaway M0 token spike - never commit (handles a live token)
+duo-token-test.ps1

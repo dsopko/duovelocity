@@ -111,7 +111,7 @@ Storage access: EF Core or Dapper — either fits; Dapper is the lighter choice 
 
 Duolingo publishes no API. DuoVelocity calls the same endpoints the web client uses. This is the single largest risk in the project (§14) and shapes several design choices.
 
-**Auth:** username + password → JWT. The JWT is sent as `Authorization: Bearer`. Lifetime is unknown; M0 decodes `exp` and tests empirically.
+**Auth:** the JWT is the credential. It is sent as `Authorization: Bearer`. Login (`POST /2023-05-23/login`, body `{ identifier, password, signal }`) requires a reCAPTCHA Enterprise token in `signal`, which only a real browser can mint — see §10.3 and §14 risk #1. So DuoVelocity does not log in server-side; the user supplies a token captured from a signed-in browser session. M0 confirmed the token lifetime: the `exp` claim is set ~200 years out and `iat` is unset, so the token does not self-expire. Only a Duolingo password change or a server-side revocation invalidates it (14-day empirical revocation test running as of 2026-09-18).
 
 **Primary endpoint:** `GET /2017-06-30/users/{id}?fields=...` (authenticated) with an explicit `fields` list. Fields used:
 
@@ -135,7 +135,8 @@ Conventions per `DB_Design_Standards.md`: PK named `<TableName>Id`; all timestam
 `AppUserId`, `ExternalSubject` (IdP subject, unique), `Email`, `DisplayName`, `TimeZoneId` (IANA, copied from Duolingo profile, nullable until first sync), `CreatedUtc`, `ModifiedUtc`
 
 **`DuolingoConnection`** — one per user (unique on `AppUserId`)
-`DuolingoConnectionId`, `AppUserId`, `DuolingoUserId`, `DuolingoUsername`, `JwtCiphertext VARBINARY(MAX)`, `JwtExpiresUtc NULL`, `PasswordCiphertext VARBINARY(MAX) NULL`, `KeyVersion`, `Status` (`Active` · `TokenExpired` · `Paused` · `Disconnected`), `LastSyncUtc`, `LastSuccessUtc`, `ConsecutiveFailures`, `CreatedUtc`, `ModifiedUtc`
+`DuolingoConnectionId`, `AppUserId`, `DuolingoUserId`, `DuolingoUsername`, `JwtCiphertext VARBINARY(MAX)`, `JwtExpiresUtc NULL`, `KeyVersion`, `Status` (`Active` · `TokenRevoked` · `Paused` · `Disconnected`), `LastSyncUtc`, `LastSuccessUtc`, `ConsecutiveFailures`, `CreatedUtc`, `ModifiedUtc`
+No password is ever stored — the token is the only credential DuoVelocity holds. `TokenRevoked` is set when Duolingo returns 401, meaning the user changed their password or the token was revoked; the user must reconnect with a fresh token.
 
 **`Course`** — courses seen for a user
 `CourseId`, `AppUserId`, `DuolingoCourseId`, `LearningLanguage`, `FromLanguage`, `Title`, `IsCurrent`, `CreatedUtc`, `ModifiedUtc`
@@ -145,7 +146,7 @@ Conventions per `DB_Design_Standards.md`: PK named `<TableName>Id`; all timestam
 Retention: keep all (v1). Revisit if multi-user growth makes 32 GB a concern; compress or keep-only-changed-hash later.
 
 **`SyncRun`** — one row per attempt
-`SyncRunId`, `AppUserId`, `StartedUtc`, `FinishedUtc`, `Outcome` (`Success` · `TokenExpired` · `Reloggedin` · `Failed`), `Message`, `XpEventsInserted`, `NodesCompleted`, `UnitsCompleted`, `CreatedUtc`
+`SyncRunId`, `AppUserId`, `StartedUtc`, `FinishedUtc`, `Outcome` (`Success` · `TokenRevoked` · `Failed`), `Message`, `XpEventsInserted`, `NodesCompleted`, `UnitsCompleted`, `CreatedUtc`
 
 **`XpEvent`** — every `xpGains` record ever seen (lessons *and* activities)
 `XpEventId BIGINT`, `AppUserId`, `CourseId`, `EventUtc`, `EventLocalDate`, `EventType`, `SkillId NULL`, `Xp`, `CreatedUtc`
@@ -172,7 +173,7 @@ Why store only transitions rather than nightly node state: a course has hundreds
 ## 9. Nightly sync
 
 ### 9.1 Trigger and fan-out
-1. **`EnqueueSyncs`** (Timer, NCRONTAB `0 30 4 * * *`, `WEBSITE_TIME_ZONE = Eastern Standard Time`) selects every `DuolingoConnection` with `Status IN ('Active','TokenExpired')` and drops one message per user on a Storage Queue.
+1. **`EnqueueSyncs`** (Timer, NCRONTAB `0 30 4 * * *`, `WEBSITE_TIME_ZONE = Eastern Standard Time`) selects every `DuolingoConnection` with `Status = 'Active'` and drops one message per user on a Storage Queue. A `TokenRevoked` connection is skipped until the user reconnects.
 2. **`SyncUser`** (Queue trigger, `batchSize` 1–2, low concurrency) runs `ISyncService.RunAsync(appUserId)` for one user.
 
 Why a queue rather than a loop inside the timer: per-user isolation (one user's failure doesn't abort the batch), free retries with poison-queue handling, no risk against the Consumption plan's function timeout (default 5 min, max 10) as users grow, and a manual sync is just "drop a message."
@@ -182,9 +183,9 @@ Why a queue rather than a loop inside the timer: per-user isolation (one user's 
 ### 9.2 Per-user run
 ```
 load connection → decrypt JWT
-  if JWT expired (exp claim) or Duolingo returns 401:
-      if PasswordCiphertext present → re-login, store new JWT, Outcome=Reloggedin
-      else → Status=TokenExpired, Outcome=TokenExpired, flag for user, STOP
+  if Duolingo returns 401:
+      Status=TokenRevoked, Outcome=TokenRevoked, flag user to reconnect, STOP
+      (no server-side re-login: login needs a browser-minted captcha token)
 fetch user payload (fields list) → RawSnapshot
 upsert Course rows; ensure TimeZoneId on AppUser
 ingest xpGains → XpEvent (skip natural-key duplicates)
@@ -217,13 +218,14 @@ Users sign in to DuoVelocity through an external identity provider; DuoVelocity 
 Every table with user data carries `AppUserId`, and every repository method takes the caller's `AppUserId` from the validated token — never from the request body. There is no cross-user query surface in v1.
 
 ### 10.3 Duolingo credentials — the honest version
-The unofficial API needs a real login, so DuoVelocity must hold something that can act as the user on Duolingo. Design:
+The unofficial API needs a real login, and M0 confirmed that login is captcha-gated: the `POST /2023-05-23/login` request carries a reCAPTCHA Enterprise token that only a real browser can produce. A headless Azure Function cannot mint one, so DuoVelocity never logs in on the server and never holds a Duolingo password. **The token is the credential, full stop.** Design:
 
-- **Always: the JWT.** On connect, the user enters their Duolingo username and password over HTTPS; the API logs in immediately, keeps the resulting JWT, and **discards the password** unless the user opts in below.
-- **Opt-in: the password.** A clearly labelled checkbox: *"Keep my password so DuoVelocity can log in again if my session expires. If you don't, sync pauses when it expires and you'll be asked to reconnect."* Default off.
+- **The token, only.** On connect, the user pastes a JWT captured from their signed-in Duolingo browser session (a short guide shows where DevTools exposes the `jwt_token` cookie). The API validates it with one authenticated call, then stores it encrypted. There is no username/password field.
+- **No expiry, so no re-login loop.** M0 found the token's `exp` claim is ~200 years out with `iat` unset — it does not self-expire. It dies only when the user changes their Duolingo password or Duolingo revokes it server-side, which surfaces as a 401 and flips the connection to `TokenRevoked`.
+- **Reconnect flow.** On `TokenRevoked`, sync pauses and the user is asked to paste a fresh token. This is the only maintenance a connected user ever performs, and only after a password change.
 - **Encryption:** AES-256-GCM with a master key held in Azure Key Vault, read at startup via managed identity. Ciphertext blob = `nonce || tag || ciphertext`; `KeyVersion` recorded for rotation.
-- **What the user is told, in plain words:** DuoVelocity's operator can technically access anything stored, because the sync process has to decrypt it to use it. A stored token lets the operator act as you *on Duolingo only*; a stored password may be one you reuse elsewhere. Change your Duolingo password at any time to invalidate everything DuoVelocity holds.
-- **Disconnect** purges both ciphertexts immediately; **delete my account** purges all rows for the user.
+- **What the user is told, in plain words:** DuoVelocity's operator can technically access the stored token, because the sync process has to decrypt it to use it. The token lets the operator act as you *on Duolingo only*. Change your Duolingo password at any time to invalidate everything DuoVelocity holds.
+- **Disconnect** purges the token ciphertext immediately; **delete my account** purges all rows for the user.
 
 ## 11. API (v1)
 
@@ -232,7 +234,7 @@ All routes under `/api/v1`, bearer auth required unless noted. JSON only. Dates 
 | Method | Route | Purpose |
 |---|---|---|
 | GET | `/me` | profile, timezone, connection status summary |
-| POST | `/duolingo/connect` | `{ username, password, rememberPassword }` → logs in, stores credentials |
+| POST | `/duolingo/connect` | `{ jwt }` → validates the token with one authenticated call, stores it encrypted |
 | DELETE | `/duolingo/connect` | disconnect; `?purgeData=true` also deletes history |
 | GET | `/duolingo/status` | status, last sync, last success, token expiry, `gapDetected` |
 | POST | `/duolingo/sync` | manual sync (enqueue); rate-limited to one per 3 min per user |
@@ -269,9 +271,9 @@ Timezones in .NET: `TimeZoneInfo.FindSystemTimeZoneById` accepts IANA ids cross-
 
 | # | Risk / unknown | Mitigation / how it gets answered |
 |---|---|---|
-| 1 | **Unofficial API** — endpoints, auth flow, or field names can change without notice; bot detection could add a captcha to login | Raw landing; parsers tolerant of extra/missing fields; alerts on unknown values; accept that a breaking change means a maintenance release |
+| 1 | **Unofficial API** — endpoints, auth flow, or field names can change without notice | Raw landing; parsers tolerant of extra/missing fields; alerts on unknown values; accept that a breaking change means a maintenance release. **M0 confirmed login is captcha-gated** (reCAPTCHA Enterprise token in the login body), so server-side login is off the table — token-only connect (§10.3) |
 | 2 | Duolingo ToS — this access is not sanctioned | Personal-scale use; one polite request per user per night; document the risk to users at connect time |
-| 3 | **JWT lifetime unknown** | M0: decode `exp`; keep a token unused for 14 days and test it |
+| 3 | ~~JWT lifetime unknown~~ **Resolved (M0):** the token's `exp` is ~200 years out with `iat` unset, so it does not self-expire. Only a password change or server-side revocation kills it (surfaces as 401 → `TokenRevoked`). 14-day empirical revocation test running as of 2026-09-18 | Reconnect flow handles the revocation case; no re-login needed |
 | 4 | Score field location unknown | M0: find it in the raw JSON; if absent, Score is dropped from v1 metrics |
 | 5 | `eventType` / `NodeType` full enumerations undocumented | Log unknowns; build the list from real data |
 | 6 | Lesson-to-node ratio may be 1 or N | Never assumed; both counted independently |
@@ -284,7 +286,7 @@ Timezones in .NET: `TimeZoneInfo.FindSystemTimeZoneById` accepts IANA ids cross-
 
 | Milestone | Deliverable | Answers |
 |---|---|---|
-| **M0 — Spike** (CLI only, no DB) | `login`, `decode-token`, `dump` (raw JSON to disk, redacted fixture for `samples/`) | Field names, `totalSessions` ratio, `eventType` values seen, Score field, JWT `exp`; start the 14-day token test |
+| **M0 — Spike** (CLI only, no DB) | ~~`login`~~ token capture from browser, `decode-token`, `dump` (raw JSON to disk, redacted fixture for `samples/`) | **Done:** login is captcha-gated (token-only connect); JWT does not self-expire; users endpoint `2017-06-30/users/{id}` works with a Bearer token. Still open: field names, `totalSessions` ratio, `eventType` values, Score field. 14-day revocation test running |
 | **M1 — Core + CLI** | Parsers, `PathDiffer` with tests on fixture JSON, `XpEvent` ingest, metrics queries; local SQL (LocalDB) | Diff algorithm correct on real data (David's own history) |
 | **M2 — Azure nightly** | Free SQL DB, Function App (timer + queue), Key Vault, App Insights; David as the only connected user | Runs unattended for two weeks |
 | **M3 — API + identity** | Entra External ID, connect/disconnect flow, metrics endpoints, F1 deploy, privacy page | Second user (family) connects successfully |
@@ -298,7 +300,8 @@ Timezones in .NET: `TimeZoneInfo.FindSystemTimeZoneById` accepts IANA ids cross-
 | 2026-09-15 | Multi-user from day one |
 | 2026-09-15 | Nightly sync 04:30 US Eastern; Windows Consumption for time-zone support |
 | 2026-09-15 | API on App Service F1; frontend TBD |
-| 2026-09-15 | Store JWT always, password opt-in; re-login on expiry only if password stored |
+| 2026-09-15 | ~~Store JWT always, password opt-in; re-login on expiry only if password stored~~ |
+| 2026-09-18 | **Superseded by M0 findings:** login is captcha-gated, so no server-side login. Token-only connect; no password ever stored; reconnect flow on 401 (`TokenRevoked`). JWT confirmed non-expiring (`exp` ~200 yrs, `iat` unset) |
 | 2026-09-15 | No-login/public-profile mode rejected — lessons and units require auth |
 | 2026-09-15 | Vocabulary fixed: Section, Unit, Node, Lesson, Activity, Score; "level" banned |
 | 2026-09-15 | Land raw JSON for every pull; store node *transitions*, not nightly node state |
