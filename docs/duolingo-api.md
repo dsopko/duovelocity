@@ -157,7 +157,7 @@ Top-level keys observed include: `title`, `learningLanguage`, `fromLanguage`, `x
 
 ### 7.1 Score — `currentCourse.scoreMetadata`
 
-The Duolingo Score (the CEFR-aligned number shown top-left on the path; users often call it their "level").
+The Duolingo Score (the CEFR-aligned number shown top-left on the path").
 
 ```json
 { "supportType": "FULLY_CEFR_ALIGNED", "reachedScore": 66, "pathStartingScore": 5, "pathEndingScore": 129 }
@@ -268,25 +268,57 @@ Found by watching the web app load `/learn` (2026-09-18): ~54 requests, nearly a
 
 ### 11.1 `GET /2023-05-23/users/{id}/xp_summaries` — daily activity (recommended)
 
-A compact per-day rollup, and the important find: **retention is ~15 months**, not 7 days. Observed 462 daily entries (2025-05-06 → 2026-09-18) in ~83 KB. Query with `startDate`.
+The daily-activity endpoint: a compact per-day rollup with **~15-month retention** (not the 7-day `xpGains` limit). Observed 462 daily entries (2025-05-06 → 2026-09-18) in ~83 KB.
 
+**Request**
 ```
-GET https://www.duolingo.com/2023-05-23/users/{id}/xp_summaries?startDate=2025-01-01
-Authorization: Bearer <jwt>
+GET https://www.duolingo.com/2023-05-23/users/{id}/xp_summaries?startDate=YYYY-MM-DD
+Authorization: Bearer <jwt>          # or the jwt_token cookie
+Accept: application/json
 ```
 
-Response: `{ "summaries": [ ... ] }`. Each entry:
+| Parameter | In | Required | Notes |
+|---|---|---|---|
+| `id` | path | yes | numeric user id (the JWT `sub`) |
+| `startDate` | query | yes | `YYYY-MM-DD`; returns entries from this date through today |
+| `_` | query | no | the web app appends `_=<epoch-ms>` as a cache-buster; optional |
 
-| Field | Meaning |
-|---|---|
-| `date` | epoch seconds, local midnight of the day |
-| `gainedXp` | total XP earned that day |
-| `numSessions` | number of sessions completed that day |
-| `totalSessionTime` | seconds spent in sessions |
-| `streakExtended`, `frozen`, `shielded`, `repaired` | streak bookkeeping |
-| `dailyGoalXp` | that day's XP goal |
+`endDate` was not tested. The app appends a cache-buster only.
 
-**Use and limits:** the cheap, long-history source for *daily activity*; it enables **~15-month backfill at connect time** instead of only observing forward. But it is a daily rollup — `numSessions` counts all sessions (lessons **and** activities) with no `skillId` and no lesson/practice split. It does **not** replace `xpGains` (§6) for per-lesson attribution, nor the path diff for unit completions.
+**Response** — a single object with one key, `summaries`, an array **ordered newest-first**:
+
+```json
+{
+  "summaries": [
+    { "date": 1789689600, "gainedXp": 123, "numSessions": 3, "totalSessionTime": 1980,
+      "dailyGoalXp": 1, "streakExtended": true, "frozen": false, "shielded": false,
+      "repaired": false, "userId": 27437326 },
+    { "date": 1789516800, "gainedXp": 501, "numSessions": 8, "totalSessionTime": 3138,
+      "dailyGoalXp": 1, "streakExtended": true, "frozen": false, "shielded": false,
+      "repaired": false, "userId": 27437326 }
+  ]
+}
+```
+
+**Entry fields** (all verified [M0]):
+
+| Field | Type | Example | Meaning |
+|---|---|---|---|
+| `date` | int | `1789689600` | the day as epoch **seconds at 00:00 UTC** — a day key (always a multiple of 86400), not a precise moment |
+| `gainedXp` | int | `501` | total XP earned that day |
+| `numSessions` | int | `8` | sessions completed that day — **lessons and activities combined** |
+| `totalSessionTime` | int | `3138` | seconds spent in sessions that day |
+| `dailyGoalXp` | int | `1` | the day's XP-goal setting |
+| `streakExtended` | bool | `true` | streak extended that day |
+| `frozen` | bool | `false` | a streak freeze applied |
+| `shielded` | bool | `false` | a streak shield applied |
+| `repaired` | bool | `false` | the streak was repaired |
+| `userId` | int | `27437326` | the user id (repeated on every entry) |
+
+**Semantics and limits:**
+- **One entry per active day.** Days with no activity are omitted — 462 entries spanned ~500 calendar days, so gaps mean "no activity," read as zero.
+- **Daily rollup only.** `numSessions` is a count with no `skillId` and no `LESSON`/`PRACTICE` split, so this endpoint cannot attribute activity to units or distinguish lessons from other practice. It complements `xpGains` (§6), it does not replace it, and it does nothing for unit-completion detection (still a path-diff job).
+- **Backfill.** Because history reaches ~15 months, daily activity can be backfilled at connect time rather than only observed forward.
 
 ### 11.2 `GET /2023-05-23/users/{id}` — newer user read
 
