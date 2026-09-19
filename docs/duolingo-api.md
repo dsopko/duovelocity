@@ -60,13 +60,13 @@ Accept: application/json
 |---|---|
 | `id`, `username`, `timezone`, `creationDate` | identity, day bucketing, account age (`creationDate` is epoch seconds) |
 | `courses[]` | course registry: `id`, `title`, `learningLanguage`, `fromLanguage`, `xp`, `crowns` |
-| `xpGains[]` | recent lesson/activity events — see §6. **~7-day retention.** |
+| `xpGains[]` | recent lesson/activity events — see §6. **~1–2 week retention (14 days observed 2026-09).** |
 | `currentCourse` | the current course incl. the full path and the Score — see §7 |
 | `streakData` | streak length and boundary dates (day resolution; not per-lesson) |
 
 **Size note [M0]:** requesting `currentCourse` returns the entire path in one response — ~9 MB / 7,635 nodes / 992 units for a mid-course Spanish learner. Land it verbatim, then persist only transitions.
 
-**Scope caveats [M0/community]:** returns the **current course only** (the one tied to the last-practiced language), and `xpGains` is only the last ~7 days.
+**Scope caveats [M0/community]:** returns the **current course only** (the one tied to the last-practiced language), and `xpGains` is only the last ~1–2 weeks (14 days observed).
 
 ---
 
@@ -142,7 +142,7 @@ Every entry is one XP-earning event. Four fields:
 
 | Field | Type | Notes |
 |---|---|---|
-| `time` | int (epoch **seconds**) | the **only per-lesson timestamp** in the whole payload; ages out in ~7 days |
+| `time` | int (epoch **seconds**) | the **only per-lesson timestamp** in the whole payload; ages out in ~1–2 weeks (14 days observed) |
 | `eventType` | string or null | observed: `LESSON`, `PRACTICE`, `null` |
 | `skillId` | string or null | present on `LESSON` events; `null` on `PRACTICE`/`null` events |
 | `xp` | int | XP earned |
@@ -222,7 +222,7 @@ Two reliable structural signals [M0]:
 
 | Source | Resolution | Retention |
 |---|---|---|
-| `xpGains[].time` | second (epoch) | ~7 days |
+| `xpGains[].time` | second (epoch) | ~1–2 weeks (14 days observed) |
 | `xp_summaries[].date` (§11.1) | day (epoch) | ~15 months |
 | `creationDate`, `streakData.*Timestamp` | second (epoch) | permanent (account/streak level) |
 | `streakData.*Streak.*Date` | day (`YYYY-MM-DD`) | permanent (streak boundaries) |
@@ -253,7 +253,7 @@ These lists are from one account's current course; log unknown values and extend
 
 ## 10. Known limitations and quirks
 
-- **~7–8 day retention applies only to per-lesson data.** `xpGains` (and legacy `calendar`) hold about a week, so a missed week is an irrecoverable gap for *lesson-level* detail (skill ids, lesson/practice split). **Daily totals do not have this limit:** `xp_summaries` (§11.1) exposes ~15 months of per-day XP and session counts, backfillable at connect time. Node/unit completions are still detected by path diff, but lose precise timestamps when the finishing lessons age out.
+- **Short retention applies only to per-lesson data.** `xpGains` holds roughly **1–2 weeks** (14 days observed 2026-09; the legacy `calendar` README claimed ~8 days — treat the window as variable and sync well inside it), so a longer gap is an irrecoverable loss of *lesson-level* detail (skill ids, lesson/practice split). **Daily totals do not have this limit:** `xp_summaries` (§11.1) exposes ~15 months of per-day XP and session counts, backfillable at connect time. Node/unit completions are still detected by path diff, but lose precise timestamps when the finishing lessons age out.
 - **Current course only.** The user read returns the last-practiced course; multi-course tracking needs separate handling.
 - **No path timestamps.** Completion dates are always derived, never read.
 - **Captcha-gated login.** No headless password login; the token is the durable credential.
@@ -268,7 +268,7 @@ Found by watching the web app load `/learn` (2026-09-18): ~54 requests, nearly a
 
 ### 11.1 `GET /2023-05-23/users/{id}/xp_summaries` — daily activity (recommended)
 
-The daily-activity endpoint: a compact per-day rollup with **~15-month retention** (not the 7-day `xpGains` limit). Observed 462 daily entries (2025-05-06 → 2026-09-18) in ~83 KB.
+The daily-activity endpoint: a compact per-day rollup with **~15-month retention** (unlike the ~1–2 week `xpGains` limit). Observed 462 daily entries (2025-05-06 → 2026-09-18) in ~83 KB.
 
 **Request**
 ```
@@ -337,7 +337,7 @@ All sub-2 KB, not needed by DuoVelocity, noted for orientation: `/users/{id}/str
 | Need | Cheap source | Full path (9 MB) required? |
 |---|---|---|
 | Daily activity (sessions/day, XP/day), backfillable ~15 mo | `xp_summaries` (§11.1) | No |
-| Lessons vs activities split (last ~7 days) | `xpGains` (§6) | No |
+| Lessons vs activities split (last ~1–2 weeks) | `xpGains` (§6) | No |
 | Score | `currentCourse.scoreMetadata` (§7.1) | No (small `fields` pull) |
 | Unit completions (units/week, units/month) | path diff (§7.2, §8) | Yes, but only on nights with new lessons |
 

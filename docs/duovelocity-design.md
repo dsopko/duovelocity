@@ -10,7 +10,7 @@
 
 Duolingo shows you a streak and today's XP, but nothing about *pace*. DuoVelocity captures a user's Duolingo progress every night and turns it into velocity: how many lessons per day, how many units per week and per month, and how the Duolingo Score — what most users call their level — moves over time.
 
-The core problem is that Duolingo keeps per-lesson history for only ~7 days and stamps no completion dates on the learning path at all. So DuoVelocity's job is to **observe daily and remember**: archive lesson events before they roll off, and manufacture unit/node completion dates by diffing nightly snapshots.
+The core problem is that Duolingo keeps per-lesson history for only ~1–2 weeks (14 days observed) and stamps no completion dates on the learning path at all. So DuoVelocity's job is to **observe daily and remember**: archive lesson events before they roll off, and manufacture unit/node completion dates by diffing nightly snapshots.
 
 **DuoVelocity tracks exactly four things.** Everything else in the payload is either supporting data or noise.
 
@@ -25,7 +25,7 @@ Deliberately outside this: lifetime XP-total dashboards, streak, and leagues, al
 
 **Goals (v1)**
 - Multi-user from day one: anyone can sign up, connect their Duolingo account, and see their own velocity.
-- Nightly sync at 04:30 US Eastern, per user, with no gaps larger than the 7-day `xpGains` window.
+- Nightly sync at 04:30 US Eastern, per user, with no gaps larger than the `xpGains` window (~1–2 weeks; 14 days observed).
 - Metrics, all derived from the four tracked things (§1): lessons/day from `LESSON` events, units/week and units/month from unit completions, Score over time, and daily XP for a consistency read. Nodes are supporting data (how unit completion is detected and dated), not a v1 metric.
 - A bearer-token JSON API that any frontend (web or mobile) can consume. Frontend itself is TBD and out of scope for this doc.
 - $0/month hosting at hobby scale on Azure free tiers.
@@ -45,7 +45,7 @@ These six words are the entity names in `Core`. The word **"level"** is banned �
 |---|---|---|
 | **Section** | Group of units (e.g. "Section 5") | `currentCourse.pathSectioned[]` |
 | **Unit** | Titled group of nodes (e.g. "Unit 63: Say where you want to go") | `pathSectioned[].units[]` |
-| **Node** | One bubble on the path: lesson, story, practice, chest, unit test | `units[].levels[]` (`type`, `state`, `finishedSessions`, `totalSessions`) |
+| **Node** | One bubble on the path. Observed `type`s: `skill`, `story`, `practice`, `duo_radio`, `chest`, `unit_review` | `units[].levels[]` (`type`, `state`, `finishedSessions`, `totalSessions`) |
 | **Lesson** | One session inside a lesson node. A node holds *N* lessons (`totalSessions`); N may be 1. | `xpGains[]` where `eventType == LESSON` |
 | **Activity** | XP-earning work *off* the path (practice zone, review of a completed node, stories replayed) | `xpGains[]` where `eventType != LESSON` |
 | **Score** | The **Duolingo Score**, shown top-left on the path and on the profile: a CEFR-aligned proficiency number, **0–130** for the major courses (English, Spanish, French), capped lower on less-developed courses. Rises as lessons, units, and sections are completed. This is what users (and older UI copy) call their "level"; named Score internally. Distinct from XP — see §7.2 | `currentCourse.scoreMetadata.reachedScore` (M0) |
@@ -111,7 +111,8 @@ DuoVelocity.sln
 │   └── DuoVelocity.Core.Tests/      diff algorithm, parsers (fixture JSON), tz bucketing
 ├── db/                              schema + migrations
 ├── docs/
-│   └── design.md                    this document
+│   ├── duovelocity-design.md        this document
+│   └── duolingo-api.md              endpoint/field reference (see §7)
 └── samples/                         redacted raw JSON fixtures (no tokens, no PII)
 ```
 
@@ -119,7 +120,7 @@ Storage access: EF Core or Dapper — either fits; Dapper is the lighter choice 
 
 ## 7. Data source — Duolingo unofficial API
 
-Duolingo publishes no API. DuoVelocity calls the same endpoints the web client uses. This is the single largest risk in the project (§14) and shapes several design choices.
+Duolingo publishes no API. DuoVelocity calls the same endpoints the web client uses. This is the single largest risk in the project (§14) and shapes several design choices. The full endpoint and field reference lives in **`docs/duolingo-api.md`**; this section covers only what the design depends on.
 
 **Auth:** the JWT is the credential. It is sent as `Authorization: Bearer`. Login (`POST /2023-05-23/login`, body `{ identifier, password, signal }`) requires a reCAPTCHA Enterprise token in `signal`, which only a real browser can mint — see §10.3 and §14 risk #1. So DuoVelocity does not log in server-side; the user supplies a token captured from a signed-in browser session. M0 confirmed the token lifetime: the `exp` claim is set ~200 years out and `iat` is unset, so the token does not self-expire. Only a Duolingo password change or a server-side revocation invalidates it (14-day empirical revocation test running as of 2026-09-18).
 
@@ -129,19 +130,19 @@ Duolingo publishes no API. DuoVelocity calls the same endpoints the web client u
 |---|---|
 | `id`, `username`, `timezone`, `learningLanguage`, `fromLanguage` | identity, day bucketing |
 | `courses[]` (`id`, `title`, `learningLanguage`, `fromLanguage`, `xp`, `crowns`) | course registry; which is current |
-| `xpGains[]` (`xp`, `skillId`, `time`, `eventType`) | lesson and activity events. `time` is the only per-lesson timestamp (Unix epoch seconds). **~7-day retention** — this is why sync is nightly and why a missed week is an irrecoverable gap. M0 saw `eventType` values `LESSON`, `PRACTICE`, and `null` — see §7.1 |
+| `xpGains[]` (`xp`, `skillId`, `time`, `eventType`) | lesson and activity events. `time` is the only per-lesson timestamp (Unix epoch seconds). **~1–2 week retention (14 days observed)** — this is why sync is nightly and why a longer gap is an irrecoverable loss. M0 saw `eventType` values `LESSON`, `PRACTICE`, and `null` — see §7.1 |
 | `currentCourse.pathSectioned[]` → `units[]` → `levels[]` (`type`, `state`, `finishedSessions`, `totalSessions`, `pathLevelMetadata`/`pathLevelClientData` incl. skill ids, unit index/name) | node and unit state. **No timestamps — confirmed by M0** (§7.1); completion dates are derived by diffing |
 | `currentCourse.scoreMetadata` (`reachedScore`, `pathStartingScore`, `pathEndingScore`, `supportType`) | the Duolingo Score and this course's Score range and cap — M0 resolved, see §7.2 |
 
 **Landing rule:** every response is stored verbatim (`RawSnapshot`) before parsing. Field names drift; the raw column is the insurance policy that lets history be re-parsed later.
 
-**Etiquette:** one request per user per night, sequential with a small delay, a descriptive `User-Agent`, exponential backoff on 429/5xx. Never hammer.
+**Etiquette:** a small number of requests per user per night (the user payload, plus `xp_summaries`, plus the ~9 MB path only when new lessons warrant it — §9.2), sequential with a small delay, a descriptive `User-Agent`, exponential backoff on 429/5xx. Never hammer.
 
 ### 7.1 Timestamps in the payload (M0 findings, 2026-09-18)
 
-M0 read a live payload and searched every field for anything temporal. The result confirms the project's founding premise: **the learning path carries no completion dates, so the only per-lesson timestamp is `xpGains[].time`, and it lives for only ~7 days.** Everything else is either account-level or streak-level and daily-resolution at best.
+M0 read a live payload and searched every field for anything temporal. The result confirms the project's founding premise: **the learning path carries no completion dates, so the only per-lesson timestamp is `xpGains[].time`, and it lives for only ~1–2 weeks (14 days observed).** Everything else is either account-level or streak-level and daily-resolution at best.
 
-**The one timestamp that matters — `xpGains[].time`.** Each `xpGains` entry (a lesson or activity event) has a `time` field in Unix epoch seconds. This is the per-lesson timestamp: it is what lets §9.3 attribute a real completion time to a node (`Attribution = LessonEvent`) instead of falling back to snapshot day. It is also the field that ages out after ~7 days, which is the whole reason the sync must run nightly. In the sample, 74 events came back with `eventType` split `LESSON` 25, `PRACTICE` 12, and **`null` 37** — a `null` type (skill id also null) is common, so §4/§5 bucketing must treat "not `LESSON`" as activity rather than testing for a specific activity type. Log unknown/`null` types (§14 risk #5).
+**The one timestamp that matters — `xpGains[].time`.** Each `xpGains` entry (a lesson or activity event) has a `time` field in Unix epoch seconds. This is the per-lesson timestamp: it is what lets §9.3 attribute a real completion time to a node (`Attribution = LessonEvent`) instead of falling back to snapshot day. It is also the field that ages out after ~1–2 weeks (14 days observed), which is the whole reason the sync must run nightly. In the sample, 74 events came back with `eventType` split `LESSON` 25, `PRACTICE` 12, and **`null` 37** — a `null` type (skill id also null) is common, so §4/§5 bucketing must treat "not `LESSON`" as activity rather than testing for a specific activity type. Log unknown/`null` types (§14 risk #5).
 
 **The path has no dates — confirmed.** A path node (`levels[]`) exposes `state` (e.g. `"passed"`), `pathLevelMetadata.nodeState` (e.g. `"passed"`), `finishedSessions`/`totalSessions` (counts), `type`/`subtype`, skill ids, indices, and score info. **None of these is a timestamp.** Names that pattern-match as temporal — `completedUnits`, `finishedSessions`, `finishedLessons`, `finishedLevels`, `completedLevels`, `checkpointFinished`, `finalLevelTimeLimit` — are all counts, flags, or a per-lesson time *limit* in seconds, never a completion date. This is why node and unit completion dates must be manufactured by diffing nightly snapshots (§9.3), exactly as designed.
 
@@ -207,7 +208,7 @@ No password is ever stored — the token is the only credential DuoVelocity hold
 
 **`RawSnapshot`** — verbatim API responses
 `RawSnapshotId BIGINT`, `AppUserId`, `CapturedUtc`, `Endpoint`, `Payload NVARCHAR(MAX)` (JSON), `PayloadHash BINARY(32)`, `CreatedUtc`
-Retention: keep all (v1). Revisit if multi-user growth makes 32 GB a concern; compress or keep-only-changed-hash later.
+Retention: keep all (v1). **Size reality (M0):** the `currentCourse` path pull is ~9 MB per snapshot (7,635 nodes), so "keep all" is ~3 GB/user/year and the free-tier 32 GB cap (§12) is reached within a handful of user-years. Mitigations, in order of preference: only fetch the 9 MB path on nights with new `LESSON` events (§9.2) so quiet nights store nothing; store the diff plus current `PathNode` state rather than a full verbatim path nightly; keep raw only when the `PayloadHash` changed; compress. The path changes slightly most active days, so hashing alone saves little.
 
 **`SyncRun`** — one row per attempt
 `SyncRunId`, `AppUserId`, `StartedUtc`, `FinishedUtc`, `Outcome` (`Success` · `TokenRevoked` · `Failed`), `Message`, `XpEventsInserted`, `NodesCompleted`, `UnitsCompleted`, `CreatedUtc`
@@ -256,29 +257,33 @@ load connection → decrypt JWT
   if Duolingo returns 401:
       Status=TokenRevoked, Outcome=TokenRevoked, flag user to reconnect, STOP
       (no server-side re-login: login needs a browser-minted captcha token)
-fetch user payload (fields list) → RawSnapshot
+fetch light payload (fields = xpGains, courses, timezone — NOT the full path) → RawSnapshot
 upsert Course rows; ensure TimeZoneId on AppUser
 ingest xpGains → XpEvent (skip natural-key duplicates)
-diff pathSectioned against PathNode → NodeCompletion, UnitCompletion; upsert PathNode
-extract Score → ScoreHistory (if changed or first of day)
 fetch xp_summaries (startDate = last stored DailyXp date, or full ~15mo on first sync) → upsert DailyXp
+if new LESSON events since last successful sync:          # skip the 9 MB pull on quiet nights
+    fetch currentCourse (path + scoreMetadata, ~9 MB) → RawSnapshot
+    diff pathSectioned against PathNode → NodeCompletion, UnitCompletion; upsert PathNode
+    extract Score → ScoreHistory (if changed or first of day)
 write SyncRun; update LastSyncUtc / LastSuccessUtc / ConsecutiveFailures
 ```
-Every step is idempotent — re-running the same night inserts nothing new. `Duolingo` HTTP failures retry with backoff inside the run; anything still failing goes back to the queue (max 3 deliveries) then to poison.
+The 9 MB `currentCourse` pull is the expensive step, so it runs only when `xpGains` shows lessons since the last sync — no new lessons means no unit progress and no path fetch. Score rides along with that pull (it lives inside `currentCourse`); a lighter Score-only source exists (`score-info`, API doc §11.3) but its exact request is unconfirmed, so on quiet nights Score is simply left unchanged. Every step is idempotent — re-running the same night inserts nothing new. `Duolingo` HTTP failures retry with backoff inside the run; anything still failing goes back to the queue (max 3 deliveries) then to poison.
 
 ### 9.3 Node completion and timestamp attribution
-A node is **complete** when `finishedSessions == totalSessions` (or `state` says passed/legendary — treat either as complete, log if they disagree).
+A node is **complete** when `state` is `passed` (or `legendary`), which is the authority. `finishedSessions == totalSessions` usually agrees, but M0 found a `unit_review` node reading `state: passed` with `finishedSessions: 0`, so **trust `state`, not the session counts**, and log any disagreement.
+
+Observed node `type` values (M0): `skill`, `story`, `practice`, `duo_radio`, `chest`, `unit_review`. The list is open — log unknowns (§14 risk #5).
 
 When tonight's payload shows a node complete that `PathNode` had as incomplete:
 1. Look for `XpEvent` rows with `EventType = 'LESSON'`, a `SkillId` in the node's `SkillIds`, and `EventUtc` after the previous successful sync. If found, `CompletedUtc` = the latest such event, `Attribution = LessonEvent`. This turns a day-resolution guess into a real timestamp.
 2. Otherwise `CompletedLocalDate` = yesterday (user's tz), `CompletedUtc` = end of that local day, `Attribution = SnapshotDay`.
 
-A **unit** is complete when every node in it whose `NodeType` counts toward progression (lesson, story, practice, unit test — i.e. everything except chests) is complete. Unit timestamp = the latest `NodeCompletion` among its nodes.
+A **unit** is complete when every progression node in it is complete. Progression nodes are the `skill`, `story`, `practice`, `duo_radio`, and `unit_review` types; **`chest` does not count**. The unit's terminal node is the `unit_review`, identifiable directly by `levelScoreInfo.touchPointType == "UNIT_END"` (every other node reads `NORMAL`); it also carries `pathLevelMetadata.unitIndex`. Unit timestamp = the latest `NodeCompletion` among its progression nodes.
 
 Legendary: flip `IsLegendary`, do not create a second completion.
 
 ### 9.4 Gaps
-`xpGains` holds ~7 days. If a user's last success is older than that, lessons in the gap are lost and the run logs a `GapDetected` warning on `SyncRun`. Two consecutive failures raise an alert (§13). Node/unit completions are *not* lost by a gap — the diff still catches them, they just fall back to `SnapshotDay` attribution.
+`xpGains` holds ~1–2 weeks (14 days observed; treat the window as variable and sync well inside it). If a user's last success is older than that, lessons in the gap are lost and the run logs a `GapDetected` warning on `SyncRun`. Two consecutive failures raise an alert (§13). Node/unit completions are *not* lost by a gap — the diff still catches them, they just fall back to `SnapshotDay` attribution.
 
 ## 10. Identity, tenancy, credentials
 
@@ -343,10 +348,10 @@ Timezones in .NET: `TimeZoneInfo.FindSystemTimeZoneById` accepts IANA ids cross-
 | # | Risk / unknown | Mitigation / how it gets answered |
 |---|---|---|
 | 1 | **Unofficial API** — endpoints, auth flow, or field names can change without notice | Raw landing; parsers tolerant of extra/missing fields; alerts on unknown values; accept that a breaking change means a maintenance release. **M0 confirmed login is captcha-gated** (reCAPTCHA Enterprise token in the login body), so server-side login is off the table — token-only connect (§10.3) |
-| 2 | Duolingo ToS — this access is not sanctioned | Personal-scale use; one polite request per user per night; document the risk to users at connect time |
+| 2 | Duolingo ToS — this access is not sanctioned | Personal-scale use; a few polite requests per user per night; document the risk to users at connect time |
 | 3 | ~~JWT lifetime unknown~~ **Resolved (M0):** the token's `exp` is ~200 years out with `iat` unset, so it does not self-expire. Only a password change or server-side revocation kills it (surfaces as 401 → `TokenRevoked`). 14-day empirical revocation test running as of 2026-09-18 | Reconnect flow handles the revocation case; no re-login needed |
 | 4 | ~~Score field location unknown~~ **Resolved (M0):** the Score is `currentCourse.scoreMetadata.reachedScore`; the course cap is `pathEndingScore` (§7.2). Score stays a v1 metric | — |
-| 5 | `eventType` / `NodeType` full enumerations undocumented | Log unknowns; build the list from real data. M0 saw `eventType` ∈ {`LESSON`, `PRACTICE`, `null`} (§7.1); node `state`/`nodeState` includes `passed`. Treat "not `LESSON`" as activity rather than matching a fixed activity type |
+| 5 | `eventType` / `NodeType` full enumerations undocumented | Log unknowns; build the list from real data. M0 saw `eventType` ∈ {`LESSON`, `PRACTICE`, `null`}; node `type` ∈ {`skill`, `story`, `practice`, `duo_radio`, `chest`, `unit_review`}; `state`/`nodeState` includes `passed`; `touchPointType` ∈ {`NORMAL`, `UNIT_END`} (§7.1, §9.3). Treat "not `LESSON`" as activity rather than matching a fixed activity type |
 | 6 | Lesson-to-node ratio may be 1 or N | Never assumed; both counted independently |
 | 7 | F1 quotas (CPU/day) could stop the API under real traffic | Monitor quotas; B1 upgrade is the escape hatch |
 | 8 | SQL free tier exhaustion at multi-user scale | "Pause until next month" setting; watch vCore-seconds; the nightly fan-out is bursty, so consider spreading users across the 04:00–05:00 hour if it becomes a problem |
@@ -373,7 +378,7 @@ Timezones in .NET: `TimeZoneInfo.FindSystemTimeZoneById` accepts IANA ids cross-
 | 2026-09-15 | API on App Service F1; frontend TBD |
 | 2026-09-15 | ~~Store JWT always, password opt-in; re-login on expiry only if password stored~~ |
 | 2026-09-18 | **Superseded by M0 findings:** login is captcha-gated, so no server-side login. Token-only connect; no password ever stored; reconnect flow on 401 (`TokenRevoked`). JWT confirmed non-expiring (`exp` ~200 yrs, `iat` unset) |
-| 2026-09-18 | M0 timestamp audit (§7.1): path has no completion dates (confirmed); `xpGains[].time` is the only per-lesson timestamp and ages out in ~7 days; `eventType` can be `null`; other timestamps (creationDate, streakData) are account/streak-level, day-resolution, not a completion source |
+| 2026-09-18 | M0 timestamp audit (§7.1): path has no completion dates (confirmed); `xpGains[].time` is the only per-lesson timestamp and ages out in ~1–2 weeks (14 days observed); `eventType` can be `null`; other timestamps (creationDate, streakData) are account/streak-level, day-resolution, not a completion source |
 | 2026-09-18 | M0 Score found (§7.2): Score is `currentCourse.scoreMetadata.reachedScore`, range 0–130 with a per-course cap (`pathEndingScore`), CEFR-aligned. Corrects the earlier "0–160". Score and XP are distinct metrics |
 | 2026-09-18 | Primary objective stated as exactly three tracked things (§1): `LESSON` events, Units, Score. Practice/activity, XP totals, streak, leagues are explicitly not tracked |
 | 2026-09-18 | Added a fourth tracked thing: **Daily XP** (`xp_summaries`), as a consistency signal. Cheap and ~15-month backfillable; stored in `DailyXp`. Still not tracked: lifetime XP-total dashboards, streak, leagues |
