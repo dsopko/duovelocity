@@ -12,26 +12,27 @@ Duolingo shows you a streak and today's XP, but nothing about *pace*. DuoVelocit
 
 The core problem is that Duolingo keeps per-lesson history for only ~7 days and stamps no completion dates on the learning path at all. So DuoVelocity's job is to **observe daily and remember**: archive lesson events before they roll off, and manufacture unit/node completion dates by diffing nightly snapshots.
 
-**DuoVelocity tracks exactly three things.** Everything else in the payload is either supporting data or noise.
+**DuoVelocity tracks exactly four things.** Everything else in the payload is either supporting data or noise.
 
-1. **`LESSON` events** — path-advancing lesson events (`xpGains[]` with `eventType = LESSON`), each carrying a `time` and a `skillId`. These are the timestamped record of what was done and when, and they must be archived before the ~7-day window erases them (§7.1). They drive lessons/day.
+1. **`LESSON` events** — path-advancing lesson events (`xpGains[]` with `eventType = LESSON`), each carrying a `time` and a `skillId`. These are the timestamped record of what was done and when, and they must be archived before the ~1–2 week window erases them (§7.1). They drive lessons/day.
 2. **Units** — a unit's completion is detected by diffing nightly snapshots and dated from the finishing `LESSON` event (§9.3). Units drive units/week and units/month. Nodes exist only to detect and date unit completion.
 3. **Score** — the Duolingo Score, `currentCourse.scoreMetadata.reachedScore` (§7.2), recorded over time.
+4. **Daily XP** — XP earned per day, from the `xp_summaries` endpoint. Cheap to get and available ~15 months back, so it needs no forward-only archiving. It gives the user a rough read on **consistency** — how often and how much they show up. It is a daily total, not lesson-level, so it does not distinguish lessons from other activity.
 
-Deliberately outside this: practice and other non-`LESSON` activity, XP totals, streak, and leagues. They are read past, not tracked.
+Deliberately outside this: lifetime XP-total dashboards, streak, and leagues, all of which Duolingo already shows. (Daily XP *is* tracked — as a consistency signal over time, not a running total.)
 
 ## 2. Goals and non-goals
 
 **Goals (v1)**
 - Multi-user from day one: anyone can sign up, connect their Duolingo account, and see their own velocity.
 - Nightly sync at 04:30 US Eastern, per user, with no gaps larger than the 7-day `xpGains` window.
-- Metrics, all derived from the three tracked things (§1): lessons/day from `LESSON` events, units/week and units/month from unit completions, Score over time. Nodes are supporting data (how unit completion is detected and dated), not a v1 metric.
+- Metrics, all derived from the four tracked things (§1): lessons/day from `LESSON` events, units/week and units/month from unit completions, Score over time, and daily XP for a consistency read. Nodes are supporting data (how unit completion is detected and dated), not a v1 metric.
 - A bearer-token JSON API that any frontend (web or mobile) can consume. Frontend itself is TBD and out of scope for this doc.
 - $0/month hosting at hobby scale on Azure free tiers.
 - Honest credential handling: users are told plainly what DuoVelocity holds and what the operator can see.
 
 **Non-goals (v1)**
-- Streak or XP-total dashboards (Duolingo already does these).
+- Streak dashboards or lifetime XP-total dashboards (Duolingo already does these). Daily XP *is* tracked, but as a per-day consistency signal, not a running total.
 - Vocabulary tracking, leagues, friends.
 - Multiple courses per user — v1 tracks the user's *current* course only.
 - Historical backfill beyond what the API exposes at connect time.
@@ -60,7 +61,8 @@ All "days" are the **user's** days, in the user's Duolingo timezone.
 | Units/week | Count of `UnitCompletion` rows grouped by ISO week of `CompletedLocalDate` |
 | Units/month | Count of `UnitCompletion` rows grouped by month of `CompletedLocalDate` |
 | Score trend | `ScoreHistory` by date |
-| Summary | 7-day and 30-day rolling averages of lessons/day; last unit completed; last sync |
+| XP/day | `DailyXp.GainedXp` by `LocalDate` — the consistency read |
+| Summary | 7-day and 30-day rolling averages of lessons/day and XP/day; last unit completed; last sync |
 
 Nodes (`NodeCompletion`) are recorded but not surfaced as a metric in v1 — they exist to derive unit completions and to attribute timestamps.
 
@@ -231,6 +233,11 @@ Unique: `(CourseId, SectionIndex, UnitIndex)`
 `Score` is `currentCourse.scoreMetadata.reachedScore` (§7.2). The per-course cap `pathEndingScore` is a property of the `Course`, not a daily fact, so it belongs on `Course` if surfaced at all, not here.
 Unique: `(AppUserId, CourseId, LocalDate)`
 
+**`DailyXp`** — one row per user per active day
+`DailyXpId`, `AppUserId`, `LocalDate`, `GainedXp`, `NumSessions`, `CreatedUtc`, `ModifiedUtc`
+Sourced from the `xp_summaries` endpoint (`date` → `LocalDate`, `gainedXp`, `numSessions`). Unlike the other tables this is **not** limited to the sync window: `xp_summaries` reaches ~15 months back, so `DailyXp` is backfilled at connect time and topped up each sync. `NumSessions` is stored for context but is not a lessons count. Inactive days have no row (read as zero).
+Unique: `(AppUserId, LocalDate)`
+
 Why store only transitions rather than nightly node state: a course has hundreds to thousands of nodes; a per-node-per-day table would be ~700k rows per user per year with almost no information in it. `RawSnapshot` already holds the full history; `PathNode` holds "now"; `NodeCompletion` holds the change.
 
 ## 9. Nightly sync
@@ -254,6 +261,7 @@ upsert Course rows; ensure TimeZoneId on AppUser
 ingest xpGains → XpEvent (skip natural-key duplicates)
 diff pathSectioned against PathNode → NodeCompletion, UnitCompletion; upsert PathNode
 extract Score → ScoreHistory (if changed or first of day)
+fetch xp_summaries (startDate = last stored DailyXp date, or full ~15mo on first sync) → upsert DailyXp
 write SyncRun; update LastSyncUtc / LastSuccessUtc / ConsecutiveFailures
 ```
 Every step is idempotent — re-running the same night inserts nothing new. `Duolingo` HTTP failures retry with backoff inside the run; anything still failing goes back to the queue (max 3 deliveries) then to poison.
@@ -368,6 +376,7 @@ Timezones in .NET: `TimeZoneInfo.FindSystemTimeZoneById` accepts IANA ids cross-
 | 2026-09-18 | M0 timestamp audit (§7.1): path has no completion dates (confirmed); `xpGains[].time` is the only per-lesson timestamp and ages out in ~7 days; `eventType` can be `null`; other timestamps (creationDate, streakData) are account/streak-level, day-resolution, not a completion source |
 | 2026-09-18 | M0 Score found (§7.2): Score is `currentCourse.scoreMetadata.reachedScore`, range 0–130 with a per-course cap (`pathEndingScore`), CEFR-aligned. Corrects the earlier "0–160". Score and XP are distinct metrics |
 | 2026-09-18 | Primary objective stated as exactly three tracked things (§1): `LESSON` events, Units, Score. Practice/activity, XP totals, streak, leagues are explicitly not tracked |
+| 2026-09-18 | Added a fourth tracked thing: **Daily XP** (`xp_summaries`), as a consistency signal. Cheap and ~15-month backfillable; stored in `DailyXp`. Still not tracked: lifetime XP-total dashboards, streak, leagues |
 | 2026-09-15 | No-login/public-profile mode rejected — lessons and units require auth |
 | 2026-09-15 | Vocabulary fixed: Section, Unit, Node, Lesson, Activity, Score; "level" banned |
 | 2026-09-15 | Land raw JSON for every pull; store node *transitions*, not nightly node state |
