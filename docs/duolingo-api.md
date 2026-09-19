@@ -132,22 +132,51 @@ Content-Type: application/json
 
 ---
 
-## 6. Activity events — `xpGains[]` [M0]
+## 6. The lesson event — `xpGains[]` [M0]
 
-Every entry is one XP-earning event. Four fields:
+**This is DuoVelocity's primary data.** A lesson completion is one entry in the `xpGains` array with `eventType == "LESSON"`. It is the only place a lesson is timestamped, so it is the record everything else (lessons/day, and dating unit completions) is built from.
 
+**Request** — `xpGains` is a field on the user object, not its own endpoint:
+```
+GET https://www.duolingo.com/2017-06-30/users/{id}?fields=xpGains
+Authorization: Bearer <jwt>
+Accept: application/json
+```
+Sub-selection works too: `fields=xpGains{time,eventType,skillId,xp}`.
+
+**Response** — the user object with one array, `xpGains`, ordered **oldest-first** (ascending `time`):
 ```json
-{ "xp": 40, "skillId": "75157f2f1304e0f4e064bb0e58e57fc5", "eventType": "LESSON", "time": 1788467441 }
+{
+  "xpGains": [
+    { "time": 1788531107, "eventType": "PRACTICE", "skillId": null, "xp": 45 },
+    { "time": 1788533693, "eventType": "LESSON", "skillId": "fa8aabcd79d7a69b5a4805599554ef52", "xp": 40 },
+    { "time": 1788534142, "eventType": null, "skillId": null, "xp": 70 }
+  ]
+}
 ```
 
-| Field | Type | Notes |
-|---|---|---|
-| `time` | int (epoch **seconds**) | the **only per-lesson timestamp** in the whole payload; ages out in ~1–2 weeks (14 days observed) |
-| `eventType` | string or null | observed: `LESSON`, `PRACTICE`, `null` |
-| `skillId` | string or null | present on `LESSON` events; `null` on `PRACTICE`/`null` events |
-| `xp` | int | XP earned |
+**Entry shape — exactly four fields, the same four on every entry** (verified [M0]: 74 entries, no entry had any other key):
 
-**Only `LESSON` events advance the path.** They carry a `skillId` that resolves to a path node → unit. `PRACTICE` and `null` events carry no `skillId` and are off-path activity. Bucket "not `LESSON`" as activity rather than matching a specific type.
+| Field | Type | Example | Meaning |
+|---|---|---|---|
+| `time` | int | `1788533693` | event time, **epoch seconds** — the only per-lesson timestamp anywhere in the API |
+| `eventType` | string \| null | `"LESSON"` | `LESSON`, `PRACTICE`, or `null` (see below) |
+| `skillId` | string \| null | `"fa8aab…"` | the skill this event belongs to; **set only on `LESSON` events**, `null` otherwise |
+| `xp` | int | `40` | XP earned by the event |
+
+**The three `eventType` values:**
+
+| `eventType` | `skillId` | What it is | Tracked? |
+|---|---|---|---|
+| `"LESSON"` | present | a path-advancing lesson — **the thing we track** | yes → lessons/day, and dates unit completions |
+| `"PRACTICE"` | `null` | practice/review, off path | no (activity, ignored) |
+| `null` | `null` | other XP-earning activity with no type | no (activity, ignored) |
+
+So a lesson is identified by `eventType == "LESSON"`, and only those carry the `skillId` that resolves to a path node → unit (§7.2). Bucket everything that is not `LESSON` as activity; do not try to match a specific activity type.
+
+**Two properties that shape storage:**
+- **No row id.** Entries have no identifier, so de-duplication needs a natural key across syncs — DuoVelocity uses `(user, time, eventType, skillId, xp)` (design doc §8, `XpEvent`).
+- **~1–2 week retention** (14 days observed). Entries roll off oldest-first, which is why lessons must be archived on every sync and why a longer gap loses lesson detail permanently (design doc §9.4).
 
 ---
 
