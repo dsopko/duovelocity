@@ -136,7 +136,7 @@ Duolingo publishes no API. DuoVelocity calls the same endpoints the web client u
 
 **Landing rule:** every response is stored verbatim (`RawSnapshot`) before parsing. Field names drift; the raw column is the insurance policy that lets history be re-parsed later.
 
-**Etiquette:** a small number of requests per user per night (the user payload, plus `xp_summaries`, plus the ~9 MB path only when new lessons warrant it — §9.2), sequential with a small delay, a descriptive `User-Agent`, exponential backoff on 429/5xx. Never hammer.
+**Etiquette:** a small number of requests per user per night (the user payload, plus `xp_summaries`, plus the path — ~575 KB gzipped, ~9 MB parsed — only when new lessons warrant it, §9.2), sequential with a small delay, a descriptive `User-Agent`, exponential backoff on 429/5xx. Never hammer.
 
 ### 7.1 Timestamps in the payload (M0 findings, 2026-09-18)
 
@@ -207,8 +207,8 @@ No password is ever stored — the token is the only credential DuoVelocity hold
 `CourseId`, `AppUserId`, `DuolingoCourseId`, `LearningLanguage`, `FromLanguage`, `Title`, `IsCurrent`, `CreatedUtc`, `ModifiedUtc`
 
 **`RawSnapshot`** — verbatim API responses
-`RawSnapshotId BIGINT`, `AppUserId`, `CapturedUtc`, `Endpoint`, `Payload NVARCHAR(MAX)` (JSON), `PayloadHash BINARY(32)`, `CreatedUtc`
-Retention: keep all (v1). **Size reality (M0):** the `currentCourse` path pull is ~9 MB per snapshot (7,635 nodes), so "keep all" is ~3 GB/user/year and the free-tier 32 GB cap (§12) is reached within a handful of user-years. Mitigations, in order of preference: only fetch the 9 MB path on nights with new `LESSON` events (§9.2) so quiet nights store nothing; store the diff plus current `PathNode` state rather than a full verbatim path nightly; keep raw only when the `PayloadHash` changed; compress. The path changes slightly most active days, so hashing alone saves little.
+`RawSnapshotId BIGINT`, `AppUserId`, `CapturedUtc`, `Endpoint`, `Payload VARBINARY(MAX)` (gzip-compressed JSON — see size note below; `NVARCHAR(MAX)` if stored uncompressed), `PayloadHash BINARY(32)`, `CreatedUtc`
+Retention: keep all (v1). **Size reality (M0, corrected 2026-09-21):** the `currentCourse` path is ~9 MB of JSON (7,635 nodes) but gzip-compresses to **~575 KB** on the wire (the web app's own call transfers 574 KB and decodes to 8.9 MB; `HttpClient` requests gzip by default). So the cost depends on how it is stored: **store `RawSnapshot` compressed** (`VARBINARY`, gzip) and it is ~575 KB/night ≈ ~200 MB/user/year, comfortably inside the free-tier 32 GB cap (§12); store it as decompressed `NVARCHAR(MAX)` JSON and it is ~9 MB/night ≈ ~3 GB/user/year, which fills 32 GB in a few user-years. Recommendation: compress the payload column. Further mitigations: only fetch the path on nights with new `LESSON` events (§9.2) so quiet nights store nothing; keep raw only when the `PayloadHash` changed; store the diff plus current `PathNode` state rather than a verbatim path every night.
 
 **`SyncRun`** — one row per attempt
 `SyncRunId`, `AppUserId`, `StartedUtc`, `FinishedUtc`, `Outcome` (`Success` · `TokenRevoked` · `Failed`), `Message`, `XpEventsInserted`, `NodesCompleted`, `UnitsCompleted`, `CreatedUtc`
@@ -261,13 +261,13 @@ fetch light payload (fields = xpGains, courses, timezone — NOT the full path) 
 upsert Course rows; ensure TimeZoneId on AppUser
 ingest xpGains → XpEvent (skip natural-key duplicates)
 fetch xp_summaries (startDate = last stored DailyXp date, or full ~15mo on first sync) → upsert DailyXp
-if new LESSON events since last successful sync:          # skip the 9 MB pull on quiet nights
-    fetch currentCourse (path + scoreMetadata, ~9 MB) → RawSnapshot
+if new LESSON events since last successful sync:          # skip the path pull on quiet nights
+    fetch currentCourse (path + scoreMetadata, ~575 KB gzipped / ~9 MB parsed) → RawSnapshot
     diff pathSectioned against PathNode → NodeCompletion, UnitCompletion; upsert PathNode
     extract Score → ScoreHistory (if changed or first of day)
 write SyncRun; update LastSyncUtc / LastSuccessUtc / ConsecutiveFailures
 ```
-The 9 MB `currentCourse` pull is the expensive step, so it runs only when `xpGains` shows lessons since the last sync — no new lessons means no unit progress and no path fetch. Score rides along with that pull (it lives inside `currentCourse`); a lighter Score-only source exists (`score-info`, API doc §11.3) but its exact request is unconfirmed, so on quiet nights Score is simply left unchanged. Every step is idempotent — re-running the same night inserts nothing new. `Duolingo` HTTP failures retry with backoff inside the run; anything still failing goes back to the queue (max 3 deliveries) then to poison.
+The `currentCourse` pull is the heaviest step (~575 KB gzipped, ~9 MB parsed), so it runs only when `xpGains` shows lessons since the last sync — no new lessons means no unit progress and no path fetch. Score rides along with that pull (it lives inside `currentCourse`); a lighter Score-only source exists (`score-info`, API doc §11.3) but its exact request is unconfirmed, so on quiet nights Score is simply left unchanged. Every step is idempotent — re-running the same night inserts nothing new. `Duolingo` HTTP failures retry with backoff inside the run; anything still failing goes back to the queue (max 3 deliveries) then to poison.
 
 ### 9.3 Node completion and timestamp attribution
 A node is **complete** when `state` is `passed` (or `legendary`), which is the authority. `finishedSessions == totalSessions` usually agrees, but M0 found a `unit_review` node reading `state: passed` with `finishedSessions: 0`, so **trust `state`, not the session counts**, and log any disagreement.
@@ -382,6 +382,7 @@ Timezones in .NET: `TimeZoneInfo.FindSystemTimeZoneById` accepts IANA ids cross-
 | 2026-09-18 | M0 Score found (§7.2): Score is `currentCourse.scoreMetadata.reachedScore`, range 0–130 with a per-course cap (`pathEndingScore`), CEFR-aligned. Corrects the earlier "0–160". Score and XP are distinct metrics |
 | 2026-09-18 | Primary objective stated as exactly three tracked things (§1): `LESSON` events, Units, Score. Practice/activity, XP totals, streak, leagues are explicitly not tracked |
 | 2026-09-18 | Added a fourth tracked thing: **Daily XP** (`xp_summaries`), as a consistency signal. Cheap and ~15-month backfillable; stored in `DailyXp`. Still not tracked: lifetime XP-total dashboards, streak, leagues |
+| 2026-09-21 | **Correction:** the path is ~9 MB parsed but only ~575 KB gzipped on the wire (the web app fetches it the same way, not cached). Earlier claim that the app avoids the full pull was a measurement error. Store `RawSnapshot` gzip-compressed (~200 MB/user/year, well inside 32 GB), not decompressed JSON (~3 GB/user/year) |
 | 2026-09-15 | No-login/public-profile mode rejected — lessons and units require auth |
 | 2026-09-15 | Vocabulary fixed: Section, Unit, Node, Lesson, Activity, Score; "level" banned |
 | 2026-09-15 | Land raw JSON for every pull; store node *transitions*, not nightly node state |

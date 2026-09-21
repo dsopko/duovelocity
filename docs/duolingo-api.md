@@ -64,7 +64,7 @@ Accept: application/json
 | `currentCourse` | the current course incl. the full path and the Score — see §7 |
 | `streakData` | streak length and boundary dates (day resolution; not per-lesson) |
 
-**Size note [M0]:** requesting `currentCourse` returns the entire path in one response — ~9 MB / 7,635 nodes / 992 units for a mid-course Spanish learner. Land it verbatim, then persist only transitions.
+**Size note [M0]:** requesting `currentCourse` returns the entire path in one response — ~9 MB of JSON / 7,635 nodes / 992 units for a mid-course Spanish learner. That is the **decompressed** size; over the wire it is gzip-compressed to **~575 KB** (verified 2026-09-21: the web app's own user call transfers 574 KB and decodes to 8.9 MB). So the transfer is cheap; only the parsed and stored form is ~9 MB. Land it verbatim (compressed, ideally), then persist only transitions.
 
 **Scope caveats [M0/community]:** returns the **current course only** (the one tied to the last-practiced language), and `xpGains` is only the last ~1–2 weeks (14 days observed).
 
@@ -293,7 +293,7 @@ These lists are from one account's current course; log unknown values and extend
 
 ## 11. Lightweight and targeted endpoints [M0]
 
-Found by watching the web app load `/learn` (2026-09-18): ~54 requests, nearly all under 5 KB. **The app never pulls the full course path on load** — the 9 MB `currentCourse` response is a consequence of DuoVelocity asking for that whole field, not an app default. The app's heaviest call is ~575 KB (`/2023-05-23/users/{id}` with a large profile/settings/courses `fields` list, which does *not* include the full path). These small endpoints cover most of DuoVelocity's needs cheaply.
+Found by watching the web app load `/learn`: ~54 requests, most under 5 KB, plus **one large one — `/2023-05-23/users/{id}`, which transfers 574 KB gzipped and decodes to 8.9 MB and does include the full path** (verified 2026-09-21). So the app *does* pull the whole path on load; it is not cached in the browser (the `duolingo` IndexedDB holds only prefetched lesson content and an offline-submit queue, and `duo.state` in localStorage has no path), so it is refetched each load. An earlier note here wrongly said the app never pulls the path — that was a mistake from reading the compressed transfer size (575 KB) as the payload size. DuoVelocity's own `fields=currentCourse` pull returns the same data. The small endpoints below still cover the daily/score needs cheaply and avoid the big pull on quiet nights.
 
 ### 11.1 `GET /2023-05-23/users/{id}/xp_summaries` — daily activity (recommended)
 
@@ -363,7 +363,7 @@ All sub-2 KB, not needed by DuoVelocity, noted for orientation: `/users/{id}/str
 
 ### 11.5 Sourcing DuoVelocity's data cheaply
 
-| Need | Cheap source | Full path (9 MB) required? |
+| Need | Cheap source | Full path (~575 KB gzipped / 9 MB parsed) required? |
 |---|---|---|
 | Daily activity (sessions/day, XP/day), backfillable ~15 mo | `xp_summaries` (§11.1) | No |
 | Lessons vs activities split (last ~1–2 weeks) | `xpGains` (§6) | No |

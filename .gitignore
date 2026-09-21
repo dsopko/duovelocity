@@ -14,3 +14,7 @@ samples/duolingo-full-es_en.pretty.json
 samples/es_en-unit194-raw.json
 samples/es_en-unit194-raw.min.json
 samples/es_en-unit194-survey.json
+
+samples/lesson-data-last5days.json
+samples/event-data-last5days.json
+samples/path-nodes-from-screenshots.csv
